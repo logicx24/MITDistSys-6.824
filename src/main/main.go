@@ -41,11 +41,19 @@ func say(s string) {
 var wg sync.WaitGroup
 
 func main() {
-	//rand.Seed(time.Now().UTC().UnixNano())
-	for i :=0;i<30;i++{
-		fmt.Println(strconv.Itoa(i) + ":" +strconv.Itoa(randInt(15,31)))
+	timer := time.NewTimer(1000*time.Millisecond)
+	for {
+		select {
+		case <- timer.C:
+			fmt.Println("hello, on tick!")
+			timer.Reset(1000*time.Millisecond)
+		}
+	}
+	for i :=0;i<100000000000;i++{
+		fmt.Println("--")
 	}
 
+	fmt.Println("exit!")
 }
 
 

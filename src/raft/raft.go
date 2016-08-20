@@ -42,9 +42,16 @@ type ApplyMsg struct {
 }
 
 const (
-	FOLLOWER   = 1
-	CANDIDATE  = 2
-	LEADER     = 3
+	_ = iota
+
+	FOLLOWER
+	CANDIDATE
+	LEADER
+
+	TM_HB = 30	// heartbeat timeout
+	TM_EC = 150	// election timeout 150~300
+
+	TM_LONG = 100000
 )
 
 //
@@ -66,11 +73,17 @@ type Raft struct {
 
 	applyCh chan ApplyMsg
 
-	ticker *time.Ticker
-	heartBeatTicker *time.Ticker
-
 	state int // follower, candidate, leader
-	hadValidRpc bool // received msg during election timeout
+	hadValidRpc bool // received valid rpc during election timeout
+
+	electTimer *time.Timer
+	hbTimer *time.Timer
+	rvChan chan RequestVoteReply
+	aeChan chan AppendEntriesReply
+
+	votesGranted int
+
+	leaderId int
 }
 
 // return currentTerm and whether this server
@@ -141,37 +154,25 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	reply.VoteGranted = false
+
 	if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-		return
-	}
-
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId{
-		rf.state = FOLLOWER
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		rf.hadValidRpc = true
-
-		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		return
 	}
 
 	if args.Term > rf.currentTerm {
-		rf.state = FOLLOWER
-		rf.currentTerm = args.Term
-		//rf.votedFor = -1
+		rf.toFollower(args.Term, -1)
+	}
+	reply.Term = rf.currentTerm
+
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId{
+		rf.toFollower(args.Term, -1)
 		rf.votedFor = args.CandidateId
 		rf.hadValidRpc = true
 
 		reply.VoteGranted = true
-		reply.Term = rf.currentTerm
-		return
 	}
-
-	reply.VoteGranted = false
-	reply.Term = rf.currentTerm
 }
 
 //
@@ -195,7 +196,6 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
-
 
 
 //
@@ -225,42 +225,16 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	reply.Success = false
 	if args.Term < rf.currentTerm {
-		reply.Success = false
 		reply.Term = rf.currentTerm
 		return
 	}
 
-	if args.Term > rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = true
-
-		rf.state = FOLLOWER
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-		rf.hadValidRpc = true
-		return
-	}
-
-
-	if rf.state == FOLLOWER {
-		reply.Term = rf.currentTerm
-		reply.Success = true
-
-		rf.hadValidRpc = true
-		rf.votedFor = -1
-	} else if rf.state == CANDIDATE {
-		reply.Term = rf.currentTerm
-		reply.Success = true
-
-		rf.state = FOLLOWER
-		rf.hadValidRpc = true
-		rf.votedFor = -1
-	}else{
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		DPrintf("heartbeat should not be here!\n")
-	}
+	reply.Success = true
+	rf.toFollower(args.Term, args.LeaderId)
+	rf.hadValidRpc = true
+	reply.Term = rf.currentTerm
 }
 
 //
@@ -294,6 +268,136 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
+func randDuration() time.Duration {
+	return time.Duration(rand.Int63() % TM_EC + TM_EC) * time.Millisecond
+}
+
+func (rf *Raft) toLeader(){
+	rf.state = LEADER
+	rf.hadValidRpc = false
+	rf.hbTimer.Reset(TM_HB*time.Millisecond)
+	rf.electTimer.Reset(TM_LONG*time.Millisecond)
+	rf.leaderId = rf.me
+}
+
+func (rf *Raft) toCandidate(){
+	rf.state = CANDIDATE
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	rf.hbTimer.Reset(TM_LONG*time.Millisecond)
+	rf.electTimer.Reset(randDuration())
+	rf.hadValidRpc = false
+	rf.votesGranted = 1
+	rf.leaderId = -1
+}
+
+func (rf *Raft) toFollower(term, leaderId int){
+	rf.state = FOLLOWER
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.hadValidRpc = false
+	rf.leaderId = leaderId
+	rf.votesGranted = 1
+
+	rf.hbTimer.Reset(TM_LONG*time.Millisecond)
+	rf.electTimer.Reset(randDuration())
+}
+
+func (rf *Raft) heartbeats(){
+	req := AppendEntriesArgs{}
+	req.Term = rf.currentTerm
+	req.LeaderId = rf.me
+
+	for i :=0;i<len(rf.peers);i++{
+		if i != rf.me {
+			go func(i int) {
+				reply := AppendEntriesReply{}
+				ok := rf.sendAppendEntries(i, req, &reply)
+				if !ok {
+					DPrintf("%d sendAppendEntries to %d failed\n",rf.me,i)
+				} else{
+					rf.aeChan <- reply
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) voting() {
+	req := RequestVoteArgs{}
+	req.Term = rf.currentTerm
+	req.CandidateId = rf.me
+
+	for i :=0;i<len(rf.peers);i++{
+		if i != rf.me {
+			go func(i int){
+				reply := RequestVoteReply{}
+				ok := rf.sendRequestVote(i, req, &reply)
+				if !ok {
+					DPrintf("%d sendRequestVote to %d failed\n",rf.me,i)
+				}else{
+					rf.rvChan <- reply
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) loop(){
+
+	rf.hbTimer = time.NewTimer(TM_LONG*time.Millisecond)
+	rf.electTimer = time.NewTimer(randDuration())
+
+	for {
+		select {
+		case reply := <- rf.aeChan:
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.toFollower(reply.Term, -1)
+			}
+			rf.mu.Unlock()
+		case reply := <- rf.rvChan:
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.toFollower(reply.Term, -1)
+			} else{
+				if rf.state == CANDIDATE{
+					if reply.VoteGranted{
+						rf.votesGranted += 1
+					}
+
+					if rf.votesGranted > (len(rf.peers)/2){
+						rf.toLeader()
+						rf.heartbeats()
+					}
+				}
+			}
+			rf.mu.Unlock()
+		case <- rf.hbTimer.C:
+			rf.mu.Lock()
+			rf.hbTimer.Reset(TM_HB*time.Millisecond)
+			rf.electTimer.Reset(TM_LONG*time.Millisecond)
+			rf.mu.Unlock()
+
+			if rf.state == LEADER {
+				rf.heartbeats()
+			}
+		case <- rf.electTimer.C:
+			rf.mu.Lock()
+
+			if rf.state == FOLLOWER || rf.state == CANDIDATE {
+				rf.toCandidate()
+				rf.voting()
+			} else if rf.state == LEADER {
+			} else{
+				DPrintf("unknown state %d for server %d\n",rf.state, rf.me)
+			}
+
+			rf.mu.Unlock()
+		}
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -318,214 +422,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.state = FOLLOWER
 	rf.hadValidRpc = false
-	rf.ticker = time.NewTicker(time.Duration(randInt(15,31)) * 10 * time.Millisecond)
-	go func() {
-		for {
-			select {
-			case <- rf.ticker.C:
-			// follower without valid rpc
-				rf.mu.Lock()
+	rf.leaderId = -1
+	rf.votesGranted = 1
+	rf.rvChan = make(chan RequestVoteReply, 100)
+	rf.aeChan = make(chan AppendEntriesReply, 100)
 
-				if rf.state == FOLLOWER && rf.hadValidRpc {
-					rf.hadValidRpc = false
-				} else if rf.state == FOLLOWER && !rf.hadValidRpc {
-					rf.state = CANDIDATE
-					rf.currentTerm += 1
-					rf.votedFor = rf.me
-
-					req := RequestVoteArgs{}
-					req.Term = rf.currentTerm
-					req.CandidateId = rf.me
-
-					votes := 1
-					for i :=0;i<len(rf.peers);i++{
-						if i != rf.me {
-							rep := RequestVoteReply{}
-							ok := rf.sendRequestVote(i, req, &rep)
-							if !ok {
-								DPrintf("%d sendRequestVote %d failed\n",rf.me,i)
-							}
-
-							if rep.Term > rf.currentTerm {
-								// roll back to follower
-								rf.state = FOLLOWER
-								rf.currentTerm = rep.Term
-								rf.votedFor = -1
-								rf.hadValidRpc = false
-								votes = 0
-								break;
-							}
-
-							if rep.VoteGranted {
-								votes += 1
-							}
-						}
-					}
-
-					if votes > (len(rf.peers)/2){
-						rf.state = LEADER
-						rf.hadValidRpc = false
-						// send heartbeat
-						req := AppendEntriesArgs{}
-						req.Term = rf.currentTerm
-						req.LeaderId = rf.me
-
-						for i :=0;i<len(rf.peers);i++{
-							if i != rf.me {
-								rep := AppendEntriesReply{}
-								ok := rf.sendAppendEntries(i, req, &rep)
-								if !ok {
-									DPrintf("%d sendAppendEntries %d failed\n",rf.me,i)
-								}
-
-								if rep.Term > rf.currentTerm {
-									rf.state = FOLLOWER
-									rf.currentTerm = rep.Term
-									rf.votedFor = -1
-									rf.hadValidRpc = false
-									break;
-								}
-							}
-						}
-					}
-				} else if rf.state == CANDIDATE{
-					rf.currentTerm += 1
-					rf.votedFor = rf.me
-					rf.hadValidRpc = false
-
-					req := RequestVoteArgs{}
-					req.Term = rf.currentTerm
-					req.CandidateId = rf.me
-
-					votes := 1
-					for i :=0;i<len(rf.peers);i++{
-						if i != rf.me {
-							rep := RequestVoteReply{}
-							ok := rf.sendRequestVote(i, req, &rep)
-							if !ok {
-								DPrintf("%d sendRequestVote %d failed\n",rf.me,i)
-							}
-
-							if rep.Term > rf.currentTerm {
-								// roll back to follower
-								rf.state = FOLLOWER
-								rf.currentTerm = rep.Term
-								rf.votedFor = -1
-								rf.hadValidRpc = false
-								votes = 0
-								break;
-							}
-
-							if rep.VoteGranted {
-								votes += 1
-							}
-						}
-					}
-
-					if votes > (len(rf.peers)/2){
-						rf.state = LEADER
-						rf.hadValidRpc = false
-						// send heartbeat
-						req := AppendEntriesArgs{}
-						req.Term = rf.currentTerm
-						req.LeaderId = rf.me
-
-						for i :=0;i<len(rf.peers);i++{
-							if i != rf.me {
-								rep := AppendEntriesReply{}
-								ok := rf.sendAppendEntries(i, req, &rep)
-								if !ok {
-									DPrintf("%d sendAppendEntries %d failed\n",rf.me,i)
-								}
-
-								if rep.Term > rf.currentTerm {
-									rf.state = FOLLOWER
-									rf.currentTerm = rep.Term
-									rf.votedFor = -1
-									rf.hadValidRpc = false
-									break;
-								}
-							}
-						}
-					}
-				} else if rf.state == LEADER {
-					rf.hadValidRpc = false
-
-					// send heartbeat
-					req := AppendEntriesArgs{}
-					req.Term = rf.currentTerm
-					req.LeaderId = rf.me
-
-					for i :=0;i<len(rf.peers);i++{
-						if i != rf.me {
-							rep := AppendEntriesReply{}
-							ok := rf.sendAppendEntries(i, req, &rep)
-							if !ok {
-								DPrintf("%d sendAppendEntries %d failed\n",rf.me,i)
-							}
-
-							if rep.Term > rf.currentTerm {
-								rf.state = FOLLOWER
-								rf.currentTerm = rep.Term
-								rf.votedFor = -1
-								rf.hadValidRpc = false
-								break;
-							}
-						}
-					}
-				} else{
-					DPrintf("unknown state %d for server %d\n",rf.state, rf.me)
-				}
-
-				rf.mu.Unlock()
-			}
-		}
-	}()
-
-
-	rf.heartBeatTicker = time.NewTicker(time.Duration(randInt(15,31)) * time.Millisecond)
-	go func() {
-		for {
-			select {
-			case <- rf.heartBeatTicker.C:
-				rf.mu.Lock()
-
-				if rf.state == LEADER {
-					req := AppendEntriesArgs{}
-					req.Term = rf.currentTerm
-					req.LeaderId = rf.me
-
-					for i :=0;i<len(rf.peers);i++{
-						if i != rf.me {
-							rep := AppendEntriesReply{}
-							ok := rf.sendAppendEntries(i, req, &rep)
-							if !ok {
-								DPrintf("%d sendAppendEntries %d failed\n",rf.me,i)
-							}
-
-							if rep.Term > rf.currentTerm {
-								rf.state = FOLLOWER
-								rf.currentTerm = rep.Term
-								rf.votedFor = -1
-								rf.hadValidRpc = false
-								break;
-							}
-						}
-					}
-				}
-
-				rf.mu.Unlock()
-			}
-		}
-	}()
+	go rf.loop()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-
 	return rf
 }
 
-func randInt(min int, max int) int {
-	return min + rand.Intn(max-min)
-}
