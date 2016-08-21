@@ -41,19 +41,21 @@ func say(s string) {
 var wg sync.WaitGroup
 
 func main() {
-	timer := time.NewTimer(1000*time.Millisecond)
-	for {
-		select {
-		case <- timer.C:
-			fmt.Println("hello, on tick!")
-			timer.Reset(1000*time.Millisecond)
-		}
-	}
-	for i :=0;i<100000000000;i++{
-		fmt.Println("--")
-	}
+	var mu sync.Mutex
+
+	mu.Lock()
+	mu.Unlock()
+	i := 0
+	mu.Lock()
+	fmt.Println("hello, on tick! %d",i)
+
+
+
+
+
 
 	fmt.Println("exit!")
+	mu.Unlock()
 }
 
 

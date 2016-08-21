@@ -50,8 +50,6 @@ const (
 
 	TM_HB = 30	// heartbeat timeout
 	TM_EC = 150	// election timeout 150~300
-
-	TM_LONG = 100000
 )
 
 //
@@ -275,8 +273,6 @@ func randDuration() time.Duration {
 func (rf *Raft) toLeader(){
 	rf.state = LEADER
 	rf.hadValidRpc = false
-	rf.hbTimer.Reset(TM_HB*time.Millisecond)
-	rf.electTimer.Reset(TM_LONG*time.Millisecond)
 	rf.leaderId = rf.me
 }
 
@@ -284,8 +280,6 @@ func (rf *Raft) toCandidate(){
 	rf.state = CANDIDATE
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.hbTimer.Reset(TM_LONG*time.Millisecond)
-	rf.electTimer.Reset(randDuration())
 	rf.hadValidRpc = false
 	rf.votesGranted = 1
 	rf.leaderId = -1
@@ -298,9 +292,6 @@ func (rf *Raft) toFollower(term, leaderId int){
 	rf.hadValidRpc = false
 	rf.leaderId = leaderId
 	rf.votesGranted = 1
-
-	rf.hbTimer.Reset(TM_LONG*time.Millisecond)
-	rf.electTimer.Reset(randDuration())
 }
 
 func (rf *Raft) heartbeats(){
@@ -345,7 +336,7 @@ func (rf *Raft) voting() {
 
 func (rf *Raft) loop(){
 
-	rf.hbTimer = time.NewTimer(TM_LONG*time.Millisecond)
+	rf.hbTimer = time.NewTimer(TM_HB*time.Millisecond)
 	rf.electTimer = time.NewTimer(randDuration())
 
 	for {
@@ -376,7 +367,6 @@ func (rf *Raft) loop(){
 		case <- rf.hbTimer.C:
 			rf.mu.Lock()
 			rf.hbTimer.Reset(TM_HB*time.Millisecond)
-			rf.electTimer.Reset(TM_LONG*time.Millisecond)
 			rf.mu.Unlock()
 
 			if rf.state == LEADER {
@@ -385,7 +375,11 @@ func (rf *Raft) loop(){
 		case <- rf.electTimer.C:
 			rf.mu.Lock()
 
-			if rf.state == FOLLOWER || rf.state == CANDIDATE {
+			rf.electTimer.Reset(randDuration())
+
+			if rf.state == FOLLOWER && rf.hadValidRpc {
+				rf.hadValidRpc = false
+			} else if (rf.state == FOLLOWER && !rf.hadValidRpc) || rf.state == CANDIDATE {
 				rf.toCandidate()
 				rf.voting()
 			} else if rf.state == LEADER {
