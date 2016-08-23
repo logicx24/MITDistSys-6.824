@@ -30,6 +30,7 @@ func Sqrt(x float64) float64 {
 }
 
 func say(s string) {
+
 	wg.Add(1)
 	defer wg.Done()
 	for i := 0; i < 5; i++ {
@@ -40,22 +41,17 @@ func say(s string) {
 
 var wg sync.WaitGroup
 
+type a struct {
+	b []int
+	t string
+}
+
 func main() {
-	var mu sync.Mutex
+	var k a
 
-	mu.Lock()
-	mu.Unlock()
-	i := 0
-	mu.Lock()
-	fmt.Println("hello, on tick! %d",i)
-
-
-
-
-
-
-	fmt.Println("exit!")
-	mu.Unlock()
+	k.b = append(k.b, 2)
+	var bb bool
+	fmt.Println(bb)
 }
 
 

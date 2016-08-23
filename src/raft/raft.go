@@ -22,6 +22,7 @@ import (
 	"labrpc"
 	"time"
 	"math/rand"
+	"sort"
 )
 
 // import "bytes"
@@ -52,6 +53,12 @@ const (
 	TM_EC = 150	// election timeout 150~300
 )
 
+// log entry
+type LogEntry struct {
+	Command     interface{}
+	Term int
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -61,13 +68,17 @@ type Raft struct {
 	persister *Persister
 	me        int // index into peers[]
 
-	// Your data here.
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
 
 	// persistent state on all servers
 	currentTerm int
 	votedFor    int
+	log []LogEntry
+
+	commitIndex int
+	lastApplied int
+
+	nextIndex []int
+	matchIndex []int
 
 	applyCh chan ApplyMsg
 
@@ -79,9 +90,58 @@ type Raft struct {
 	rvChan chan RequestVoteReply
 	aeChan chan AppendEntriesReply
 
+	commitChan chan bool
+
 	votesGranted int
 
 	leaderId int
+}
+
+//
+// example RequestVote RPC arguments structure.
+//
+type RequestVoteArgs struct {
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
+}
+
+//
+// example RequestVote RPC reply structure.
+//
+type RequestVoteReply struct {
+	Term int
+	VoteGranted bool
+}
+
+//
+// example AppendEntries RPC arguments structure.
+//
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []LogEntry
+	LeaderCommit int
+}
+
+//
+// example AppendEntries RPC reply structure.
+//
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+
+	// add following to update nextIndex and matchIndex in leader
+	WhoAmI int // peer index, who am i
+	EntriesSize int // Entries size from AppendEntriesArgs
+	PrevLogIndex int // PrevLogIndex from AppendEntriesArgs
+
+	// If AppendEntries fails because of log inconsistency:
+	// decrement nextIndex and retry
+	LogInconsistency int
 }
 
 // return currentTerm and whether this server
@@ -90,7 +150,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
-	// Your code here.
+
 	term = rf.currentTerm
 	isleader = rf.state == LEADER
 	return term, isleader
@@ -124,25 +184,31 @@ func (rf *Raft) readPersist(data []byte) {
 	// d.Decode(&rf.yyy)
 }
 
+// start the electing process
+func (rf *Raft) voting() {
+	index,term := 0,0
+	index = len(rf.log)-1
+	term = rf.log[index].Term
 
+	req := RequestVoteArgs{}
+	req.Term = rf.currentTerm
+	req.CandidateId = rf.me
+	req.LastLogIndex = index
+	req.LastLogTerm = term
 
-
-//
-// example RequestVote RPC arguments structure.
-//
-type RequestVoteArgs struct {
-	// Your data here.
-	Term int
-	CandidateId int
-}
-
-//
-// example RequestVote RPC reply structure.
-//
-type RequestVoteReply struct {
-	// Your data here.
-	Term int
-	VoteGranted bool
+	for i :=0;i<len(rf.peers);i++{
+		if i != rf.me {
+			go func(i int){
+				reply := RequestVoteReply{}
+				ok := rf.sendRequestVote(i, req, &reply)
+				if !ok {
+					DPrintf("%d sendRequestVote to %d failed\n",rf.me,i)
+				}else{
+					rf.rvChan <- reply
+				}
+			}(i)
+		}
+	}
 }
 
 //
@@ -165,11 +231,24 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId{
-		rf.toFollower(args.Term, -1)
-		rf.votedFor = args.CandidateId
-		rf.hadValidRpc = true
+		myLastIndex := len(rf.log)-1
+		myLastTerm := rf.log[myLastIndex].Term
 
-		reply.VoteGranted = true
+		/*
+		Raft determines which of two logs is more up-to-date
+		by comparing the index and term of the last entries in the
+		logs. If the logs have last entries with different terms, then
+		the log with the later term is more up-to-date. If the logs
+		end with the same term, then whichever log is longer is
+		more up-to-date.
+		*/
+		if args.LastLogTerm > myLastTerm ||(args.LastLogTerm == myLastTerm && args.LastLogIndex >= myLastIndex){
+			rf.toFollower(args.Term, -1)
+			rf.votedFor = args.CandidateId
+			rf.hadValidRpc = true
+
+			reply.VoteGranted = true
+		}
 	}
 }
 
@@ -195,25 +274,6 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 	return ok
 }
 
-
-//
-// example AppendEntries RPC arguments structure.
-//
-type AppendEntriesArgs struct {
-	// Your data here.
-	Term int
-	LeaderId int
-}
-
-//
-// example AppendEntries RPC reply structure.
-//
-type AppendEntriesReply struct {
-	// Your data here.
-	Term int
-	Success bool
-}
-
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
@@ -224,15 +284,64 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	defer rf.mu.Unlock()
 
 	reply.Success = false
+	reply.WhoAmI = rf.me
+	reply.EntriesSize = len(args.Entries)
+	reply.PrevLogIndex = args.PrevLogIndex
+
+	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		return
+	}
+
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
+	// whose term matches prevLogTerm (§5.3)
+	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm{
+		reply.Term = rf.currentTerm
+		reply.LogInconsistency++
+		return
+	}
+
+	// 3. If an existing entry conflicts with a new one (same index
+	// but different terms), delete the existing entry and all that
+	// follow it (§5.3)
+	for i,e := range args.Entries {
+		if len(rf.log) > i && rf.log[i].Term != e.Term{
+			rf.log = rf.log[:i]
+			break;
+		}
+	}
+
+	// 4. Append any new entries not already in the log
+	for i,e := range args.Entries {
+		if i >= len(rf.log) {
+			rf.log = append(rf.log, e)
+		}
+	}
+
+	// 5. If leaderCommit > commitIndex, set commitIndex =
+	// min(leaderCommit, index of last new entry)
+	if args.LeaderCommit > rf.commitIndex {
+		i := len(rf.log)-1
+		if i > args.LeaderCommit{
+			i = args.LeaderCommit
+		}
+
+		rf.commitIndex = i
 	}
 
 	reply.Success = true
 	rf.toFollower(args.Term, args.LeaderId)
 	rf.hadValidRpc = true
 	reply.Term = rf.currentTerm
+}
+
+func (rf *Raft) lastIndex() int{
+	return len(rf.log)-1
+}
+
+func (rf *Raft) lastTerm() int{
+	return rf.log[len(rf.log)-1].Term
 }
 
 //
@@ -249,11 +358,43 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	index := -1
 	term := rf.currentTerm
 	isLeader := rf.state == LEADER
 
+	if isLeader {
+		index = rf.lastIndex() + 1
+		rf.log = append(rf.log, LogEntry{command,term})
+		rf.commitChan <- true
+	}
+
 	return index, term, isLeader
+}
+
+// prepare an AppendEntriesArgs
+func (rf *Raft) makeAeArgs(command interface{}) (AppendEntriesArgs,LogEntry) {
+	var args AppendEntriesArgs
+	args.LeaderCommit = rf.commitIndex
+	args.LeaderId = rf.me
+	args.PrevLogIndex = len(rf.log)-1
+	args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+	args.Term = rf.currentTerm
+
+	var ent LogEntry
+	ent.Term = rf.currentTerm
+	ent.Command = command
+
+	args.Entries = append(args.Entries, ent)
+
+	return args,ent
+}
+
+func (rf *Raft) makeAeArgs2(command interface{}) AppendEntriesArgs {
+	args,_ := rf.makeAeArgs(command)
+	return args
 }
 
 //
@@ -274,6 +415,12 @@ func (rf *Raft) toLeader(){
 	rf.state = LEADER
 	rf.hadValidRpc = false
 	rf.leaderId = rf.me
+	for i := range rf.nextIndex{
+		rf.nextIndex[i] = len(rf.log)
+	}
+	for i := range rf.matchIndex{
+		rf.matchIndex[i] = 0
+	}
 }
 
 func (rf *Raft) toCandidate(){
@@ -294,10 +441,10 @@ func (rf *Raft) toFollower(term, leaderId int){
 	rf.votesGranted = 1
 }
 
-func (rf *Raft) heartbeats(){
-	req := AppendEntriesArgs{}
-	req.Term = rf.currentTerm
-	req.LeaderId = rf.me
+func (rf *Raft) heartbeats(req AppendEntriesArgs){
+	if rf.state != LEADER {
+		return
+	}
 
 	for i :=0;i<len(rf.peers);i++{
 		if i != rf.me {
@@ -314,23 +461,40 @@ func (rf *Raft) heartbeats(){
 	}
 }
 
-func (rf *Raft) voting() {
-	req := RequestVoteArgs{}
-	req.Term = rf.currentTerm
-	req.CandidateId = rf.me
+// If last log index ≥ nextIndex for a follower: send
+// AppendEntries RPC with log entries starting at nextIndex
+// • If successful: update nextIndex and matchIndex for
+// follower (§5.3)
+// • If AppendEntries fails because of log inconsistency:
+// decrement nextIndex and retry (§5.3)
+func (rf *Raft) syncFollower(i int){
+	if rf.state != LEADER {
+		return
+	}
 
-	for i :=0;i<len(rf.peers);i++{
-		if i != rf.me {
-			go func(i int){
-				reply := RequestVoteReply{}
-				ok := rf.sendRequestVote(i, req, &reply)
-				if !ok {
-					DPrintf("%d sendRequestVote to %d failed\n",rf.me,i)
-				}else{
-					rf.rvChan <- reply
-				}
-			}(i)
+	lastLogIndex := len(rf.log) - 1
+	if i != rf.me && lastLogIndex >= rf.nextIndex[i]{
+		var args AppendEntriesArgs
+		args.LeaderCommit = rf.commitIndex
+		args.LeaderId = rf.me
+		args.PrevLogIndex = rf.nextIndex[i]-1
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		args.Term = rf.currentTerm
+
+		for i := rf.nextIndex[i];i<=lastLogIndex;i++{
+			args.Entries = append(args.Entries, rf.log[i])
 		}
+
+		go func(i int) {
+			reply := AppendEntriesReply{}
+			reply.LogInconsistency = 1
+			ok := rf.sendAppendEntries(i, args, &reply)
+			if !ok {
+				DPrintf("%d syncFollower %d failed\n",rf.me,i)
+			} else{
+				rf.aeChan <- reply
+			}
+		}(i)
 	}
 }
 
@@ -346,6 +510,34 @@ func (rf *Raft) loop(){
 			if reply.Term > rf.currentTerm {
 				rf.toFollower(reply.Term, -1)
 			}
+
+			if rf.state == LEADER {
+				if reply.Success && reply.EntriesSize > 0{
+					rf.matchIndex[reply.WhoAmI] = reply.PrevLogIndex + reply.EntriesSize
+					rf.nextIndex[reply.WhoAmI] = reply.PrevLogIndex + reply.EntriesSize + 1
+
+					// If there exists an N such that N > commitIndex, a majority
+					// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+					// set commitIndex = N (§5.3, §5.4).
+					// leader only counts a majority of replicas for currentTerm
+					tmp := make([]int, len(rf.matchIndex))
+					copy(tmp, rf.matchIndex)
+					sort.Ints(tmp)
+					N := tmp[len(tmp)/2 + 1]
+
+					if N > rf.commitIndex && N < len(rf.log) && rf.log[N].Term == rf.currentTerm{
+						rf.commitIndex = N
+					}
+				}
+
+				// If last log index ≥ nextIndex for a follower, sync
+				if !reply.Success && reply.LogInconsistency == 2 {
+					if rf.nextIndex[reply.WhoAmI] > 1 {
+						rf.nextIndex[reply.WhoAmI] = rf.nextIndex[reply.WhoAmI] -1
+						rf.syncFollower(reply.WhoAmI)
+					}
+				}
+			}
 			rf.mu.Unlock()
 		case reply := <- rf.rvChan:
 			rf.mu.Lock()
@@ -359,7 +551,7 @@ func (rf *Raft) loop(){
 
 					if rf.votesGranted > (len(rf.peers)/2){
 						rf.toLeader()
-						rf.heartbeats()
+						rf.heartbeats(rf.makeAeArgs2(nil))
 					}
 				}
 			}
@@ -367,11 +559,15 @@ func (rf *Raft) loop(){
 		case <- rf.hbTimer.C:
 			rf.mu.Lock()
 			rf.hbTimer.Reset(TM_HB*time.Millisecond)
-			rf.mu.Unlock()
 
-			if rf.state == LEADER {
-				rf.heartbeats()
+			rf.heartbeats(rf.makeAeArgs2(nil))
+
+			// If last log index ≥ nextIndex for a follower, sync it
+			for i :=0;i<len(rf.peers);i++{
+				rf.syncFollower(i)
 			}
+
+			rf.mu.Unlock()
 		case <- rf.electTimer.C:
 			rf.mu.Lock()
 
@@ -387,6 +583,13 @@ func (rf *Raft) loop(){
 				DPrintf("unknown state %d for server %d\n",rf.state, rf.me)
 			}
 
+			rf.mu.Unlock()
+		case <- rf.commitChan:
+			rf.mu.Lock()
+			for i := rf.lastApplied+1;i<=rf.commitIndex;i++{
+				rf.applyCh <- ApplyMsg{Index:i,Command:rf.log[i].Command}
+				rf.lastApplied = i
+			}
 			rf.mu.Unlock()
 		}
 	}
@@ -418,8 +621,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.hadValidRpc = false
 	rf.leaderId = -1
 	rf.votesGranted = 1
+	rf.log = append(rf.log, LogEntry{Term:0})
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 	rf.rvChan = make(chan RequestVoteReply, 100)
 	rf.aeChan = make(chan AppendEntriesReply, 100)
+	rf.commitChan = make(chan bool, 100)
 
 	go rf.loop()
 
