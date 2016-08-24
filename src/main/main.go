@@ -47,11 +47,33 @@ type a struct {
 }
 
 func main() {
-	var k a
+	c1 := make(chan string)
+	c2 := make(chan string)
 
-	k.b = append(k.b, 2)
-	var bb bool
-	fmt.Println(bb)
+	go func() {
+		for i := 0; i < 20000000000; i++{
+			time.Sleep(time.Millisecond * 100)
+			//c1 <- "one"
+		}
+	}()
+	go func() {
+		for i := 0; i < 20000000000; i++{
+			time.Sleep(time.Millisecond * 110)
+			//c2 <- "two"
+		}
+	}()
+
+	for  {
+		select {
+		case msg1 := <-c1:
+			fmt.Println("1 received", msg1)
+		case msg2 := <-c2:
+			fmt.Println("2 received", msg2)
+		case <-time.After(time.Duration(200) * time.Millisecond):
+			fmt.Println("time up")
+			//return
+		}
+	}
 }
 
 
