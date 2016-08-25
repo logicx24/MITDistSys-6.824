@@ -22,6 +22,7 @@ import (
 	"labrpc"
 	"time"
 	"math/rand"
+	"sort"
 )
 
 // import "bytes"
@@ -263,11 +264,37 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 	}
 
 	if rf.state == LEADER && ok {
-		if reply.Success {
+		if reply.Success && len(args.Entries) > 0{
 			rf.nextIndex[server] = reply.LastIndex + 1
+			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+
+			// If there exists an N such that N > commitIndex, a majority
+			// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+			// set commitIndex = N (§5.3, §5.4).
+			// leader only counts a majority of replicas for currentTerm
+			tmp := make([]int, len(rf.matchIndex))
+			copy(tmp, rf.matchIndex)
+			sort.Ints(tmp)
+			N := tmp[len(tmp)/2 + 1]
+
+			if N > rf.commitIndex && N < len(rf.log) && rf.log[N].Term == rf.currentTerm{
+				rf.commitIndex = N
+				rf.commitChan <- true
+			}
+		}
+
+		// If last log index ≥ nextIndex for a follower: send
+		// AppendEntries RPC with log entries starting at nextIndex
+		// • If successful: update nextIndex and matchIndex for
+		// follower (§5.3)
+		// • If AppendEntries fails because of log inconsistency:
+		// decrement nextIndex and retry (§5.3)
+		if !reply.Success && len(args.Entries) > 0 && reply.LastIndex > 0{
+			if rf.nextIndex[server] > 1{
+				rf.nextIndex[server] = reply.LastIndex
+			}
 		}
 	}
-
 	return ok
 }
 
@@ -277,7 +304,7 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	reply.Success = false
 	reply.Term = rf.currentTerm
-
+	reply.LastIndex = 0
 	// 1. Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.currentTerm {
 		return
@@ -292,13 +319,21 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
 	// whose term matches prevLogTerm (§5.3)
 	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm{
+		reply.LastIndex = args.PrevLogIndex
+		for i := args.PrevLogIndex-1;i>0;i--{
+			if rf.log[args.PrevLogIndex].Term == rf.log[i].Term{
+				reply.LastIndex = i
+			}else{
+				break
+			}
+		}
 		return
 	}
 
 	tmp := rf.log[0:args.PrevLogIndex+1]
 	tmp = append(tmp, args.Entries...)
 	rf.log = tmp
-	rf.currentTerm = args.Term
+	rf.toFollower(args.Term, args.LeaderId)
 	rf.hadValidRpc = true
 
 	reply.Success = true
@@ -315,6 +350,30 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.commitIndex = i
 
 		rf.commitChan <- true
+	}
+}
+
+func (rf *Raft) heartbeats(){
+	if rf.state != LEADER {
+		return
+	}
+
+	for i :=0;i<len(rf.peers);i++{
+		if i != rf.me {
+			var args AppendEntriesArgs
+			args.LeaderCommit = rf.commitIndex
+			args.LeaderId = rf.me
+			args.PrevLogIndex = rf.nextIndex[i]-1
+			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+			args.Term = rf.currentTerm
+
+			tmp := rf.log[args.PrevLogIndex+1:]
+			args.Entries = make([]LogEntry, len(tmp))
+			copy(args.Entries, tmp)
+
+			reply := AppendEntriesReply{}
+			go rf.sendAppendEntries(i, args, &reply)
+		}
 	}
 }
 
@@ -352,9 +411,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.log = append(rf.log, LogEntry{Command:command,Term:term})
 
 		// why add this can pass ?
-		rf.commitIndex = index
-
-		rf.commitChan <- true
+		//rf.commitIndex = index
+		//rf.commitChan <- true
 	}
 
 	return index, term, isLeader
@@ -380,12 +438,11 @@ func (rf *Raft) toLeader(){
 	rf.leaderId = rf.me
 
 	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 	index := rf.lastIndex() + 1
 	for idx := 0; idx < len(rf.peers); idx++ {
 		rf.nextIndex[idx] = index
-	}
-	for i := range rf.matchIndex{
-		rf.matchIndex[i] = 0
+		rf.matchIndex[idx] = 0
 	}
 }
 
@@ -405,30 +462,6 @@ func (rf *Raft) toFollower(term, leaderId int){
 	rf.hadValidRpc = false
 	rf.leaderId = leaderId
 	rf.votesGranted = 1
-}
-
-func (rf *Raft) heartbeats(){
-	if rf.state != LEADER {
-		return
-	}
-
-	for i :=0;i<len(rf.peers);i++{
-		if i != rf.me {
-			var args AppendEntriesArgs
-			args.LeaderCommit = rf.commitIndex
-			args.LeaderId = rf.me
-			args.PrevLogIndex = rf.nextIndex[i]-1
-			args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-			args.Term = rf.currentTerm
-
-			tmp := rf.log[args.PrevLogIndex+1:]
-			args.Entries = make([]LogEntry, len(tmp))
-			copy(args.Entries, tmp)
-
-			reply := AppendEntriesReply{}
-			go rf.sendAppendEntries(i, args, &reply)
-		}
-	}
 }
 
 func (rf *Raft) loop(){
