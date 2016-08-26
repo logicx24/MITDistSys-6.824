@@ -22,6 +22,7 @@ import (
 	"labrpc"
 	"time"
 	"math/rand"
+	"sort"
 )
 
 // import "bytes"
@@ -434,30 +435,12 @@ func (rf *Raft) heartbeats(){
 		// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 		// set commitIndex = N (§5.3, §5.4).
 		// leader only counts a majority of replicas for currentTerm
-		//tmp := make([]int, len(rf.matchIndex))
-		//copy(tmp, rf.matchIndex)
-		//sort.Ints(tmp)
-		//N := tmp[len(tmp)/2 + 1]
-		//
-		//if N > rf.commitIndex && N < len(rf.log) && rf.log[N].Term == rf.currentTerm{
-		//	rf.commitIndex = N
-		//	rf.commitChan <- true
-		//}
+		tmp := make([]int, len(rf.matchIndex))
+		copy(tmp, rf.matchIndex)
+		sort.Ints(tmp)
+		N := tmp[len(tmp)/2 + 1]
 
-		N := rf.commitIndex
-		last := rf.lastIndex()
-		for i := rf.commitIndex + 1; i <= last; i++ {
-			num := 1
-			for j := range rf.peers {
-				if j != rf.me && rf.matchIndex[j] >= i && rf.log[i].Term == rf.currentTerm {
-					num++
-				}
-			}
-			if 2*num > len(rf.peers) {
-				N = i
-			}
-		}
-		if N != rf.commitIndex {
+		if N > rf.commitIndex && N < len(rf.log) && rf.log[N].Term == rf.currentTerm{
 			rf.commitIndex = N
 			rf.chanCommit <- true
 		}
