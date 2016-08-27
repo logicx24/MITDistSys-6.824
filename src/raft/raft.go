@@ -23,11 +23,22 @@ import (
 	"time"
 	"math/rand"
 	"sort"
+	"bytes"
+	"encoding/gob"
 )
 
 // import "bytes"
 // import "encoding/gob"
 
+// **** notes
+// *************************************************
+// referenced https://github.com/doggeral/6.824-golab
+// for the channel and time.After way of implementing
+// election as well as heartbeat mechanism instead of
+// using timer, though the latter is more intuitive,
+// but may cause some interleaves for example sending
+// AppendEntriesArgs
+// *************************************************
 
 
 //
@@ -141,26 +152,24 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here.
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	 w := new(bytes.Buffer)
+	 e := gob.NewEncoder(w)
+	 e.Encode(rf.currentTerm)
+	 e.Encode(rf.votedFor)
+	 e.Encode(rf.log)
+	 data := w.Bytes()
+	 rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here.
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	 r := bytes.NewBuffer(data)
+	 d := gob.NewDecoder(r)
+	 d.Decode(&rf.currentTerm)
+	 d.Decode(&rf.votedFor)
+	 d.Decode(&rf.log)
 }
 
 func (rf *Raft) lastIndex() int{
@@ -195,6 +204,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if isLeader {
 		index = rf.lastIndex() + 1
 		rf.log = append(rf.log, LogEntry{Command:command,Term:term})
+
+		rf.persist()
 	}
 
 	return index, term, isLeader
@@ -221,6 +232,8 @@ func (rf *Raft) toLeader(){
 		rf.nextIndex[i] = index
 		rf.matchIndex[i] = 0
 	}
+
+	rf.persist()
 }
 
 func (rf *Raft) toCandidate(){
@@ -229,6 +242,8 @@ func (rf *Raft) toCandidate(){
 	rf.votedFor = rf.me
 	rf.votesGranted = 1
 	rf.leaderId = -1
+
+	rf.persist()
 }
 
 func (rf *Raft) toFollower(term, leaderId int){
@@ -237,6 +252,8 @@ func (rf *Raft) toFollower(term, leaderId int){
 	rf.votedFor = -1
 	rf.leaderId = leaderId
 	rf.votesGranted = 1
+
+	rf.persist()
 }
 
 // start the electing process
@@ -288,6 +305,8 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 			rf.toFollower(args.Term, -1)
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
+
+			rf.persist()
 		}
 	}
 }
