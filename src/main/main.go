@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"math/rand"
+	"encoding/base64"
+	crand "crypto/rand"
 )
 
 const Threadhold = float64(0.0000001)
@@ -46,34 +48,19 @@ type a struct {
 	t string
 }
 
+func randstring(n int) string {
+	b := make([]byte, 2*n)
+	crand.Read(b)
+	s := base64.URLEncoding.EncodeToString(b)
+	return s[0:n]
+}
+
 func main() {
-	c1 := make(chan string)
-	c2 := make(chan string)
-
-	go func() {
-		for i := 0; i < 20000000000; i++{
-			time.Sleep(time.Millisecond * 100)
-			//c1 <- "one"
-		}
-	}()
-	go func() {
-		for i := 0; i < 20000000000; i++{
-			time.Sleep(time.Millisecond * 110)
-			//c2 <- "two"
-		}
-	}()
-
-	for  {
-		select {
-		case msg1 := <-c1:
-			fmt.Println("1 received", msg1)
-		case msg2 := <-c2:
-			fmt.Println("2 received", msg2)
-		case <-time.After(time.Duration(200) * time.Millisecond):
-			fmt.Println("time up")
-			//return
-		}
-	}
+	m := make(map[string]string)
+	m["1"] = "1"
+	s := m["2"]
+	fmt.Println(m)
+	fmt.Println(s)
 }
 
 
