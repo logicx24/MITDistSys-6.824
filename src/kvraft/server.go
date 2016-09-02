@@ -8,6 +8,7 @@ import (
 	"sync"
 	"fmt"
 	"time"
+	"strconv"
 )
 
 const Debug = 0
@@ -40,10 +41,18 @@ type RaftKV struct {
 	kvs map[string]string // key->value
 
 	res map[int]chan Op
+
+	oldRequests map[string]string
 }
 
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
+	_,l := kv.rf.GetState()
+	if !l{
+		reply.WrongLeader = true
+		return
+	}
+
 	op := Op{Key:args.Key,Value:"",Cid:args.Cid,Seq:args.Seq,Action:"Get"}
 
 	index,_,isLeader := kv.rf.Start(op)
@@ -78,6 +87,15 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	kv.mu.Lock()
+	_,yes := kv.oldRequests[strconv.FormatInt(args.Cid,10)+":"+strconv.FormatInt(args.Seq,10)]
+	if yes{
+		reply.WrongLeader = false
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
 	op := Op{Key:args.Key,Value:args.Value,Cid:args.Cid,Seq:args.Seq,Action:args.Op}
 
 	index,_,isLeader := kv.rf.Start(op)
@@ -146,6 +164,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.kvs = make(map[string]string)
 	kv.res = make(map[int]chan Op)
+	kv.oldRequests = make(map[string]string)
 
 	go func(){
 		for {
@@ -153,22 +172,26 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			case rep := <-kv.applyCh:
 				kv.mu.Lock()
 
-				msg := rep.Command.(Op)
-				v, _ := kv.kvs[msg.Key]
-				if msg.Action == "Put" {
-					kv.kvs[msg.Key] = msg.Value
-				}else if msg.Action == "Append" {
-					kv.kvs[msg.Key] = v+msg.Value
-				}else{
-				}
+				msg, ok:= rep.Command.(Op)
+				if ok{
+					v, _ := kv.kvs[msg.Key]
+					if msg.Action == "Put" {
+						kv.kvs[msg.Key] = msg.Value
+					}else if msg.Action == "Append" {
+						kv.kvs[msg.Key] = v+msg.Value
+					}else{
+					}
 
-				index := rep.Index
-				channel, ok := kv.res[index]
-				if !ok {
-					channel = make(chan Op)
-					kv.res[index] = channel
-				}else{
-					channel <- msg
+					kv.oldRequests[strconv.FormatInt(msg.Cid,10)+":"+strconv.FormatInt(msg.Seq,10)] = msg.Key+":"+msg.Value
+
+					index := rep.Index
+					channel, ok := kv.res[index]
+					if !ok {
+						channel = make(chan Op)
+						kv.res[index] = channel
+					}else{
+						channel <- msg
+					}
 				}
 
 				kv.mu.Unlock()

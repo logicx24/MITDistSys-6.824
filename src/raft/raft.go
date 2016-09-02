@@ -562,6 +562,7 @@ func (rf *Raft) candidateDaemon(){
 				rf.mu.Lock()
 				rf.toLeader()
 				rf.mu.Unlock()
+				rf.Start(nil)
 			case <- time.After(time.Duration(rand.Int63()%333+550)*time.Millisecond):
 			}
 		}else{
