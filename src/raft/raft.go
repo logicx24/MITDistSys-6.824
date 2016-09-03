@@ -25,6 +25,7 @@ import (
 	"sort"
 	"bytes"
 	"encoding/gob"
+	"fmt"
 )
 
 // import "bytes"
@@ -194,13 +195,14 @@ func (rf *Raft) lastTerm() int{
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	fmt.Println(fmt.Sprintf("Server %d Start %v",rf.me, command))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	index := -1
 	term := rf.currentTerm
 	isLeader := rf.state == LEADER
-
+	fmt.Println(fmt.Sprintf("Server %d isLeader=%v 1",rf.me, isLeader))
 	if isLeader {
 		index = rf.lastIndex() + 1
 		rf.log = append(rf.log, LogEntry{Command:command,Term:term})
@@ -208,6 +210,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 	}
 
+	fmt.Println(fmt.Sprintf("Server %d isLeader=%v 2",rf.me, isLeader))
 	return index, term, isLeader
 }
 
@@ -259,10 +262,13 @@ func (rf *Raft) toFollower(term, leaderId int){
 // start the electing process
 func (rf *Raft) voting() {
 	req := RequestVoteArgs{}
+
+	rf.mu.Lock()
 	req.Term = rf.currentTerm
 	req.CandidateId = rf.me
 	req.LastLogIndex = rf.lastIndex()
 	req.LastLogTerm = rf.lastTerm()
+	rf.mu.Unlock()
 
 	for i :=0;i<len(rf.peers);i++{
 		if i != rf.me && rf.state == CANDIDATE{
@@ -551,8 +557,8 @@ func (rf *Raft) candidateDaemon(){
 		if rf.state == CANDIDATE{
 			rf.mu.Lock()
 			rf.toCandidate()
-			rf.voting()
 			rf.mu.Unlock()
+			rf.voting()
 			select {
 			case <- rf.chanHeart:
 				rf.mu.Lock()
@@ -562,7 +568,7 @@ func (rf *Raft) candidateDaemon(){
 				rf.mu.Lock()
 				rf.toLeader()
 				rf.mu.Unlock()
-				rf.Start(nil)
+				//rf.Start(nil)
 			case <- time.After(time.Duration(rand.Int63()%333+550)*time.Millisecond):
 			}
 		}else{

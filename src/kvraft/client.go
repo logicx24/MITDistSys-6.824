@@ -14,6 +14,8 @@ type Clerk struct {
 	cid int64
 	seq int64
 	mu sync.Mutex
+
+	leader int
 }
 
 func nrand() int64 {
@@ -29,6 +31,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.cid = nrand()
 	ck.seq = 0
+	ck.leader = -1
 	return ck
 }
 
@@ -53,11 +56,22 @@ func (ck *Clerk) Get(key string) string {
 	ck.mu.Unlock()
 
 	for {
+		if ck.leader != -1 {
+			reply := GetReply{}
+			ok := ck.servers[ck.leader].Call("RaftKV.Get", &args, &reply)
+			if ok {
+				if !reply.WrongLeader{
+					return reply.Value
+				}
+			}
+		}
+
 		for i := range ck.servers{
 			reply := GetReply{}
 			ok := ck.servers[i].Call("RaftKV.Get", &args, &reply)
 			if ok {
-				if !reply.WrongLeader && reply.Err == ""{
+				if !reply.WrongLeader{
+					ck.leader = i
 					return reply.Value
 				}
 			}
@@ -88,7 +102,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			reply := PutAppendReply{}
 			ok := ck.servers[i].Call("RaftKV.PutAppend", &args, &reply)
 			if ok {
-				if !reply.WrongLeader && reply.Err == ""{
+				if !reply.WrongLeader{
 					return
 				}
 			}

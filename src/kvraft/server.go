@@ -8,7 +8,6 @@ import (
 	"sync"
 	"fmt"
 	"time"
-	"strconv"
 )
 
 const Debug = 0
@@ -37,92 +36,88 @@ type RaftKV struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
-	kvs map[string]string // key->value
+	kvs map[string]string
 
 	res map[int]chan Op
 
-	oldRequests map[string]string
+	oldRequests map[int64]int64
 }
 
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	_,l := kv.rf.GetState()
-	if !l{
-		reply.WrongLeader = true
-		return
-	}
+	DPrintf(fmt.Sprintf("Server %d Get %v",kv.me, *args))
 
 	op := Op{Key:args.Key,Value:"",Cid:args.Cid,Seq:args.Seq,Action:"Get"}
 
+	reply.WrongLeader = true
+	reply.Err = ""
+
 	index,_,isLeader := kv.rf.Start(op)
-	if isLeader == false {
-		reply.WrongLeader = true
-		return
-	}
-
-	kv.mu.Lock()
-	_,ok := kv.res[index]
-	if !ok{
-		kv.res[index] = make(chan Op)
-	}
-	kv.mu.Unlock()
-
-	select{
-	case rep := <- kv.res[index]:
-		if rep == op{
-			reply.WrongLeader = false
-
-			kv.mu.Lock()
-			reply.Value = kv.kvs[args.Key]
-			kv.mu.Unlock()
-		}else{
-			reply.Err = Error
+	DPrintf(fmt.Sprintf("Server %d Get index %d, isLeader %v",kv.me, index, isLeader))
+	if isLeader {
+		kv.mu.Lock()
+		_,ok := kv.res[index]
+		if !ok{
+			kv.res[index] = make(chan Op)
 		}
-	case <-time.After(time.Duration(500)*time.Millisecond):
-		reply.Err = TimeOut
+		kv.mu.Unlock()
+
+		DPrintf(fmt.Sprintf("Server %d Get before select",kv.me))
+		select{
+		case rep := <- kv.res[index]:
+			DPrintf(fmt.Sprintf("Server %d Get rep %v",kv.me,rep))
+			if rep == op{
+				reply.WrongLeader = false
+
+				kv.mu.Lock()
+				reply.Value = kv.kvs[args.Key]
+				kv.mu.Unlock()
+			}else{
+				reply.Err = Error
+			}
+		case <-time.After(time.Duration(500)*time.Millisecond):
+			reply.Err = TimeOut
+			DPrintf(fmt.Sprintf("Server %d Get timeout",kv.me))
+		}
 	}
 
-	DPrintf(fmt.Sprintf("Get %v with reply %v",*args, *reply))
+	DPrintf(fmt.Sprintf("Server %d Get %v with reply %v",kv.me, *args, *reply))
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	kv.mu.Lock()
-	_,yes := kv.oldRequests[strconv.FormatInt(args.Cid,10)+":"+strconv.FormatInt(args.Seq,10)]
-	if yes{
-		reply.WrongLeader = false
-		kv.mu.Unlock()
-		return
-	}
-	kv.mu.Unlock()
+	DPrintf(fmt.Sprintf("Server %d PutAppend %v",kv.me, *args))
 
 	op := Op{Key:args.Key,Value:args.Value,Cid:args.Cid,Seq:args.Seq,Action:args.Op}
 
+	reply.WrongLeader = true
+	reply.Err = ""
+
 	index,_,isLeader := kv.rf.Start(op)
-	if isLeader == false {
-		reply.WrongLeader = true
-		return
-	}
-
-	kv.mu.Lock()
-	_,ok := kv.res[index]
-	if !ok{
-		kv.res[index] = make(chan Op)
-	}
-	kv.mu.Unlock()
-
-	select{
-	case rep := <- kv.res[index]:
-		if rep == op{
-			reply.WrongLeader = false
-		}else{
-			reply.Err = Error
+	DPrintf(fmt.Sprintf("Server %d PutAppend index %d, isLeader %v",kv.me,index, isLeader))
+	if isLeader{
+		kv.mu.Lock()
+		_,ok := kv.res[index]
+		if !ok{
+			kv.res[index] = make(chan Op)
 		}
-	case <-time.After(500*time.Millisecond):
-		reply.Err = TimeOut
+		kv.mu.Unlock()
+
+		DPrintf(fmt.Sprintf("Server %d PutAppend before select",kv.me))
+		select{
+		case rep := <- kv.res[index]:
+			DPrintf(fmt.Sprintf("Server %d PutAppend rep %v",kv.me,rep))
+			if rep == op{
+				reply.WrongLeader = false
+			}else{
+				reply.Err = Error
+			}
+		case <-time.After(500*time.Millisecond):
+			reply.Err = TimeOut
+			DPrintf(fmt.Sprintf("Server %d PutAppend timeout",kv.me))
+		}
 	}
 
-	DPrintf(fmt.Sprintf("PutAppend %v with reply %v",*args, *reply))
+	DPrintf(fmt.Sprintf("Server %d PutAppend %v with reply %v",kv.me,*args, *reply))
 }
 
 //
@@ -164,7 +159,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.kvs = make(map[string]string)
 	kv.res = make(map[int]chan Op)
-	kv.oldRequests = make(map[string]string)
+	kv.oldRequests = make(map[int64]int64)
 
 	go func(){
 		for {
@@ -173,16 +168,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				kv.mu.Lock()
 
 				msg, ok:= rep.Command.(Op)
+				DPrintf(fmt.Sprintf("Server %d applyCh %v %v",me,msg, ok))
 				if ok{
-					v, _ := kv.kvs[msg.Key]
-					if msg.Action == "Put" {
-						kv.kvs[msg.Key] = msg.Value
-					}else if msg.Action == "Append" {
-						kv.kvs[msg.Key] = v+msg.Value
-					}else{
-					}
+					DPrintf(fmt.Sprintf("Server %d applyCh msg.Seq:%d, oldSeq=%d",me,msg.Seq, kv.oldRequests[msg.Cid]))
+					if msg.Seq > kv.oldRequests[msg.Cid]{
+						if msg.Action == "Put" {
+							kv.kvs[msg.Key] = msg.Value
+						}else if msg.Action == "Append" {
+							kv.kvs[msg.Key] += msg.Value
+						}else{
+						}
 
-					kv.oldRequests[strconv.FormatInt(msg.Cid,10)+":"+strconv.FormatInt(msg.Seq,10)] = msg.Key+":"+msg.Value
+						kv.oldRequests[msg.Cid] = msg.Seq
+					}
 
 					index := rep.Index
 					channel, ok := kv.res[index]
