@@ -58,7 +58,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Lock()
 		_,ok := kv.res[index]
 		if !ok{
-			kv.res[index] = make(chan Op)
+			kv.res[index] = make(chan Op, 1)
 		}
 		kv.mu.Unlock()
 
@@ -98,7 +98,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Lock()
 		_,ok := kv.res[index]
 		if !ok{
-			kv.res[index] = make(chan Op)
+			kv.res[index] = make(chan Op, 1)
 		}
 		kv.mu.Unlock()
 
@@ -185,7 +185,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 					index := rep.Index
 					channel, ok := kv.res[index]
 					if !ok {
-						channel = make(chan Op)
+						channel = make(chan Op, 1)
 						kv.res[index] = channel
 					}else{
 						channel <- msg
