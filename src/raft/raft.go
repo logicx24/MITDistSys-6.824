@@ -141,11 +141,33 @@ type AppendEntriesReply struct {
 	NextIndex int
 }
 
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	Offset int
+	Data[] byte
+	Done bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == LEADER
 }
+
+//func (rf *Raft) GetLogBytes() int {
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
+//
+//	var ent LogEntry
+//	return len(rf.log)*unsafe.Sizeof(ent)
+//}
 
 //
 // save Raft's persistent state to stable storage,
@@ -214,6 +236,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+func (rf *Raft) Snapshot(){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// persist log up to lastApplied
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.lastApplied)
+	e.Encode(rf.log[rf.lastApplied].Term)
+	log := rf.log[0:rf.lastApplied+1]
+	e.Encode(log)
+	rf.persister.SaveSnapshot(w.Bytes())
+
+	rf.log = rf.log[rf.lastApplied+1:]
+}
+
 //
 // the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
@@ -255,6 +293,37 @@ func (rf *Raft) toFollower(term, leaderId int){
 	rf.votesGranted = 1
 
 	rf.persist()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if ok && reply.Term > rf.currentTerm {
+		rf.toFollower(reply.Term, -1)
+	}
+
+	return ok
+}
+
+func (rf *Raft) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.toFollower(args.Term, args.LeaderId)
+	}
+	reply.Term = rf.currentTerm
+
+	rf.persister.SaveSnapshot(args.Data)
 }
 
 // start the electing process

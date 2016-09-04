@@ -197,5 +197,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		}
 	}()
 
+	//go func(){
+	//	for {
+	//		select {
+	//		case <- time.After(20000*time.Millisecond):
+	//			if kv.rf.GetLogBytes() > kv.maxraftstate {
+	//
+	//			}
+	//		}
+	//	}
+	//
+	//}()
+
 	return kv
 }
