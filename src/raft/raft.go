@@ -208,9 +208,9 @@ func (rf *Raft) readSnapshot(data []byte) {
 
 		rf.log = rf.brokeLog(index,term,rf.log)
 
-		rf.persist()
-
-		rf.applyCh <- ApplyMsg{UseSnapshot:true,Snapshot:data}
+		go func(){
+			rf.applyCh <- ApplyMsg{UseSnapshot:true,Snapshot:data}
+		}()
 	}
 }
 
@@ -290,8 +290,10 @@ func (rf *Raft) DoSnapshot(data []byte, appliedIndex int){
 	e := gob.NewEncoder(w)
 	e.Encode(rf.log[0].Index)
 	e.Encode(rf.log[0].Term)
-	e.Encode(data)
-	rf.persister.SaveSnapshot(w.Bytes())
+
+	snapshot := w.Bytes()
+	snapshot = append(snapshot, data...)
+	rf.persister.SaveSnapshot(snapshot)
 }
 
 //
@@ -373,14 +375,14 @@ func (rf *Raft) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshot
 	reply.Term = rf.currentTerm
 
 	rf.persister.SaveSnapshot(args.Data)
-	rf.applyCh <- ApplyMsg{UseSnapshot:true,Snapshot:args.Data}
 
 	rf.log = rf.brokeLog(args.LastIncludedIndex,args.LastIncludedTerm,rf.log)
 	rf.commitIndex = args.LastIncludedIndex
 	rf.lastApplied = args.LastIncludedIndex
 	rf.persist()
 
-	rf.chanCommit <- true
+	rf.applyCh <- ApplyMsg{UseSnapshot:true,Snapshot:args.Data}
+
 }
 
 // start the electing process
@@ -410,6 +412,7 @@ func (rf *Raft) voting() {
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	reply.VoteGranted = false
 
@@ -437,8 +440,6 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 			rf.toFollower(args.Term, -1)
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
-
-			rf.persist()
 		}
 	}
 }
@@ -548,9 +549,9 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	}
 
 	baseIndex := rf.log[0].Index
-	if rf.log[args.PrevLogIndex-baseIndex].Term != args.PrevLogTerm{
+	if args.PrevLogIndex > baseIndex && rf.log[args.PrevLogIndex-baseIndex].Term != args.PrevLogTerm{
 		reply.NextIndex = args.PrevLogIndex
-		for i := len(rf.log)-1;i>0;i--{
+		for i := len(rf.log)-1;i>=0;i--{
 			if rf.log[args.PrevLogIndex-baseIndex].Term == rf.log[i].Term{
 				reply.NextIndex = rf.log[i].Index
 			}else{
@@ -560,14 +561,19 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		return
 	}
 
-	tmp := rf.log[:args.PrevLogIndex+1-baseIndex]
-	tmp = append(tmp, args.Entries...)
-	rf.log = tmp
-	rf.toFollower(args.Term, args.LeaderId)
+	if args.PrevLogIndex >= baseIndex{
+		tmp := rf.log[:args.PrevLogIndex+1-baseIndex]
+		tmp = append(tmp, args.Entries...)
+		rf.log = tmp
+		rf.toFollower(args.Term, args.LeaderId)
 
-	reply.Success = true
-	reply.Term = rf.currentTerm
-	reply.NextIndex = rf.lastIndex() + 1
+		reply.Success = true
+		reply.Term = rf.currentTerm
+		reply.NextIndex = rf.lastIndex() + 1
+	}else{
+		reply.Term = rf.currentTerm
+		reply.NextIndex = rf.log[0].Index + 1
+	}
 
 	// 5. If leaderCommit > commitIndex, set commitIndex =
 	// min(leaderCommit, index of last new entry)
