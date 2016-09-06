@@ -8,6 +8,7 @@ import (
 	"sync"
 	"fmt"
 	"time"
+	"bytes"
 )
 
 const Debug = 0
@@ -165,49 +166,65 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			select {
 			case rep := <-kv.applyCh:
-				kv.mu.Lock()
+				if rep.UseSnapshot {
+					var lastIndex int
+					var lastTerm int
 
-				msg, ok:= rep.Command.(Op)
-				DPrintf(fmt.Sprintf("Server %d applyCh %v %v",me,msg, ok))
-				if ok{
-					DPrintf(fmt.Sprintf("Server %d applyCh msg.Seq:%d, oldSeq=%d",me,msg.Seq, kv.oldRequests[msg.Cid]))
-					if msg.Seq > kv.oldRequests[msg.Cid]{
-						if msg.Action == "Put" {
-							kv.kvs[msg.Key] = msg.Value
-						}else if msg.Action == "Append" {
-							kv.kvs[msg.Key] += msg.Value
-						}else{
+					r := bytes.NewBuffer(rep.Snapshot)
+					d := gob.NewDecoder(r)
+
+					kv.mu.Lock()
+
+					d.Decode(&lastIndex)
+					d.Decode(&lastTerm)
+					kv.kvs = make(map[string]string)
+					kv.oldRequests = make(map[int64]int64)
+					d.Decode(&kv.kvs)
+					d.Decode(&kv.oldRequests)
+
+					kv.mu.Unlock()
+				}else {
+					msg, ok:= rep.Command.(Op)
+					DPrintf(fmt.Sprintf("Server %d applyCh %v %v",me,msg, ok))
+					if ok{
+						kv.mu.Lock()
+
+						DPrintf(fmt.Sprintf("Server %d applyCh msg.Seq:%d, oldSeq=%d",me,msg.Seq, kv.oldRequests[msg.Cid]))
+						if msg.Seq > kv.oldRequests[msg.Cid]{
+							if msg.Action == "Put" {
+								kv.kvs[msg.Key] = msg.Value
+							}else if msg.Action == "Append" {
+								kv.kvs[msg.Key] += msg.Value
+							}else{
+							}
+
+							kv.oldRequests[msg.Cid] = msg.Seq
 						}
 
-						kv.oldRequests[msg.Cid] = msg.Seq
-					}
+						index := rep.Index
+						channel, ok := kv.res[index]
+						if !ok {
+							channel = make(chan Op, 1)
+							kv.res[index] = channel
+						}else{
+							channel <- msg
+						}
 
-					index := rep.Index
-					channel, ok := kv.res[index]
-					if !ok {
-						channel = make(chan Op, 1)
-						kv.res[index] = channel
-					}else{
-						channel <- msg
+						if maxraftstate > 0 && kv.rf.GetLogBytes() > maxraftstate {
+							w := new(bytes.Buffer)
+							e := gob.NewEncoder(w)
+							e.Encode(kv.kvs)
+							e.Encode(kv.oldRequests)
+							data := w.Bytes()
+							go kv.rf.DoSnapshot(data, rep.Index)
+						}
+
+						kv.mu.Unlock()
 					}
 				}
-
-				kv.mu.Unlock()
 			}
 		}
 	}()
-
-	//go func(){
-	//	for {
-	//		select {
-	//		case <- time.After(20000*time.Millisecond):
-	//			if kv.rf.GetLogBytes() > kv.maxraftstate {
-	//
-	//			}
-	//		}
-	//	}
-	//
-	//}()
 
 	return kv
 }
