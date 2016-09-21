@@ -55,12 +55,32 @@ func randstring(n int) string {
 	return s[0:n]
 }
 
+type Mutatable struct {
+	a int
+	b int
+	ints []int
+}
+
+func (m Mutatable) StayTheSame() {
+	m.a = 5
+	m.b = 7
+	m.ints[0]=2
+}
+
+func (m *Mutatable) Mutate() {
+	m.a = 5
+	m.b = 7
+	m.ints[0]=2
+}
+
 func main() {
-	m := make(map[string]string)
-	m["1"] = "1"
-	s := m["2"]
-	fmt.Println(m)
-	fmt.Println(s)
+	ma := make(map[int]string)
+	ma[1] = "1"
+	ma[2] = "2"
+	fmt.Println(ma)
+
+	delete(ma, 1)
+	fmt.Println(ma)
 }
 
 
