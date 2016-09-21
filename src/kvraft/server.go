@@ -76,6 +76,10 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		}
 	}
 
+	kv.mu.Lock()
+	delete(kv.res, index)
+	kv.mu.Unlock()
+
 	DPrintf(fmt.Sprintf("Server %d Get %v with reply %v",kv.me, *args, *reply))
 }
 
@@ -105,6 +109,10 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = TimeOut
 		}
 	}
+
+	kv.mu.Lock()
+	delete(kv.res, index)
+	kv.mu.Unlock()
 
 	DPrintf(fmt.Sprintf("Server %d PutAppend %v with reply %v",kv.me,*args, *reply))
 }
