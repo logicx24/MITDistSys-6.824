@@ -12,7 +12,10 @@ import "labrpc"
 import "crypto/rand"
 import "math/big"
 import "shardmaster"
-import "time"
+import (
+	"time"
+	"sync"
+)
 
 //
 // which shard is a key in?
@@ -40,6 +43,11 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	cid int64
+	seq int64
+	mu sync.Mutex
+
+	leader int
 }
 
 //
@@ -56,6 +64,9 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.cid = nrand()
+	ck.seq = 0
+	ck.leader = -1
 	return ck
 }
 
@@ -68,10 +79,17 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.Cid = ck.cid
+
+	ck.mu.Lock()
+	ck.seq++
+	args.Seq = ck.seq
+	ck.mu.Unlock()
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		args.Gid = gid
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
@@ -103,11 +121,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
+	args.Cid = ck.cid
 
+	ck.mu.Lock()
+	ck.seq++
+	args.Seq = ck.seq
+	ck.mu.Unlock()
 
 	for {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		args.Gid = gid
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])

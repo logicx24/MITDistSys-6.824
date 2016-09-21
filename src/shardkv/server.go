@@ -5,14 +5,33 @@ package shardkv
 import "labrpc"
 import "raft"
 import "sync"
-import "encoding/gob"
+import (
+	"encoding/gob"
+	"log"
+	"time"
+	"fmt"
+	"bytes"
+)
 
+const Debug = 0
 
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key string
+	Value string
+	Cid int64
+	Seq int64
+	Action string
+	Gid int
 }
 
 type ShardKV struct {
@@ -26,15 +45,98 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvs map[string]string // k-v data store
+
+	oldRequests map[int64]int64 // preserve client request
+
+	res map[int]chan Op // per client request channel
 }
 
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	reply.WrongLeader = true
+	reply.Err = ""
+
+	if args.Gid != kv.gid {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	op := Op{Key:args.Key,Value:"",Cid:args.Cid,Seq:args.Seq,Action:"Get",Gid:args.Gid}
+
+	index,_,isLeader := kv.rf.Start(op)
+	if isLeader {
+		kv.mu.Lock()
+		_,ok := kv.res[index]
+		if !ok{
+			kv.res[index] = make(chan Op, 1)
+		}
+		kv.mu.Unlock()
+
+		select{
+		case rep := <- kv.res[index]:
+			if rep == op{
+				reply.WrongLeader = false
+				reply.Err = OK
+
+				kv.mu.Lock()
+				reply.Value = kv.kvs[args.Key]
+				kv.mu.Unlock()
+			}else{
+				reply.Err = ""
+			}
+		case <-time.After(time.Duration(500)*time.Millisecond):
+			reply.Err = TimeOut
+		}
+	}
+
+	kv.mu.Lock()
+	delete(kv.res, index)
+	kv.mu.Unlock()
+
+	DPrintf(fmt.Sprintf("Server %d Get %v with reply %v",kv.me, *args, *reply))
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	reply.WrongLeader = true
+	reply.Err = ""
+
+	if args.Gid != kv.gid {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	op := Op{Key:args.Key,Value:args.Value,Cid:args.Cid,Seq:args.Seq,Action:args.Op,Gid:args.Gid}
+
+	index,_,isLeader := kv.rf.Start(op)
+	if isLeader{
+		kv.mu.Lock()
+		_,ok := kv.res[index]
+		if !ok{
+			kv.res[index] = make(chan Op, 1)
+		}
+		kv.mu.Unlock()
+
+		select{
+		case rep := <- kv.res[index]:
+			if rep == op{
+				reply.WrongLeader = false
+				reply.Err = OK
+			}else{
+				reply.Err = ""
+			}
+		case <-time.After(500*time.Millisecond):
+			reply.Err = TimeOut
+		}
+	}
+
+	kv.mu.Lock()
+	delete(kv.res, index)
+	kv.mu.Unlock()
+
+	DPrintf(fmt.Sprintf("Server %d PutAppend %v with reply %v",kv.me,*args, *reply))
 }
 
 //
@@ -90,6 +192,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
+	kv.kvs = make(map[string]string)
+	kv.res = make(map[int]chan Op)
+	kv.oldRequests = make(map[int64]int64)
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
@@ -97,6 +202,70 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go func(){
+		for {
+			select {
+			case rep := <-kv.applyCh:
+				if rep.UseSnapshot {
+					var lastIndex int
+					var lastTerm int
+
+					r := bytes.NewBuffer(rep.Snapshot)
+					d := gob.NewDecoder(r)
+
+					kv.mu.Lock()
+
+					d.Decode(&lastIndex)
+					d.Decode(&lastTerm)
+					kv.kvs = make(map[string]string)
+					kv.oldRequests = make(map[int64]int64)
+					d.Decode(&kv.kvs)
+					d.Decode(&kv.oldRequests)
+
+					kv.mu.Unlock()
+				}else {
+					msg, ok:= rep.Command.(Op)
+					if ok{
+						kv.mu.Lock()
+
+						// execute command
+						if msg.Seq > kv.oldRequests[msg.Cid]{
+							if msg.Action == "Put" {
+								kv.kvs[msg.Key] = msg.Value
+							}else if msg.Action == "Append" {
+								kv.kvs[msg.Key] += msg.Value
+							}else{
+							}
+
+							kv.oldRequests[msg.Cid] = msg.Seq
+						}
+
+						// send msg to wake up client wait
+						index := rep.Index
+						channel, ok := kv.res[index]
+						if !ok {
+							channel = make(chan Op, 1)
+							kv.res[index] = channel
+						}else{
+							channel <- msg
+						}
+
+						// check if snapshot
+						if maxraftstate > 0 && kv.rf.GetRaftLogSize() > maxraftstate {
+							w := new(bytes.Buffer)
+							e := gob.NewEncoder(w)
+							e.Encode(kv.kvs)
+							e.Encode(kv.oldRequests)
+							data := w.Bytes()
+							go kv.rf.DoSnapshot(data, rep.Index)
+						}
+
+						kv.mu.Unlock()
+					}
+				}
+			}
+		}
+	}()
 
 	return kv
 }
