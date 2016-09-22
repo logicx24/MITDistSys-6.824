@@ -30,6 +30,7 @@ type PutAppendArgs struct {
 	Cid int64
 	Seq int64
 	Gid int
+	Shard int
 }
 
 type PutAppendReply struct {
@@ -43,6 +44,7 @@ type GetArgs struct {
 	Cid int64
 	Seq int64
 	Gid int
+	Shard int
 }
 
 type GetReply struct {
