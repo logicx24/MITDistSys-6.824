@@ -60,12 +60,10 @@ func (sm *ShardMaster) lastConf() *Config{
 func (sm *ShardMaster) newConfig() *Config{
 	lastConfig := sm.lastConf()
 
-	var shards [NShards]int
-
 	var config Config
 
-	config.Num = lastConfig.Num + 1
-	config.Shards = shards
+	config.Num = len(sm.configs)
+	config.Shards = [NShards]int{}
 	config.Groups = make(map[int][]string)
 
 	for k,v := range lastConfig.Groups{
@@ -198,6 +196,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	sm.configs = make([]Config, 1)
 	sm.configs[0].Groups = map[int][]string{}
+	sm.configs[0].Num = 0
+	sm.configs[0].Shards = [NShards]int{}
 
 	gob.Register(Op{})
 	sm.applyCh = make(chan raft.ApplyMsg)
@@ -224,24 +224,36 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 func (sm *ShardMaster) execute(msg *Op, index int){
 	sm.mu.Lock()
 
-	opReply := &OpReply{Cid:msg.Cid,Seq:msg.Seq}
+	opReply := &OpReply{Cid:msg.Cid,Seq:msg.Seq,WrongLeader:true}
 
 	// execute command
 	if msg.Seq > sm.oldRequests[msg.Cid]{
 		switch msg.Action{
 		case "Join":
+			opReply.WrongLeader = false
 			sm.doJoin(msg)
 		case "Leave":
+			opReply.WrongLeader = false
 			sm.doLeave(msg)
 		case "Move":
+			opReply.WrongLeader = false
 			sm.doMove(msg)
 		case "Query":
+			opReply.WrongLeader = false
 			sm.doQuery(msg, opReply)
 		default:
 			break;
 		}
 
 		sm.oldRequests[msg.Cid] = msg.Seq
+	}else{
+		if msg.Action == "Query"{
+			if msg.Num == -1 || msg.Num >= len(sm.configs){
+				opReply.Conf = sm.configs[len(sm.configs)-1]
+			}else{
+				opReply.Conf = sm.configs[msg.Num]
+			}
+		}
 	}
 
 	// send msg to wake up client wait
