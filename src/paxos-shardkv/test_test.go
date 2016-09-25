@@ -1,4 +1,4 @@
-package shardkv
+package paxos_shardkv
 
 import "testing"
 import "shardmaster"

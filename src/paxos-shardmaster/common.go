@@ -1,4 +1,4 @@
-package shardmaster
+package paxox_shardmaster
 
 //
 // Master shard server: assigns shards to replication groups.

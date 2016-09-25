@@ -1,4 +1,4 @@
-package shardmaster
+package paxox_shardmaster
 
 import "net"
 import "fmt"
